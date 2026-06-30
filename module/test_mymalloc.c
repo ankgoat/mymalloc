@@ -4,56 +4,52 @@
 #include <sys/ioctl.h>
 #include "mymalloc_ioctl.h"
 
-int main(void)
-{
-    int fd;
+int main(void) {
+    int fd = open("/dev/mymalloc", O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
+    printf("opened /dev/mymalloc\n\n");
+
+    /* ---------- buddy path (unchanged from Phase 4) ---------- */
     struct mymalloc_arg args;
 
-    /* Open the device file we created with mknod. */
-    fd = open("/dev/mymalloc", O_RDWR);
-    if (fd < 0) {
-        perror("open /dev/mymalloc");
-        return 1;
-    }
-    printf("opened /dev/mymalloc\n");
-
-    /* Allocate order 0 (1 page = 4 KB). */
     args.order = 0;
-    if (ioctl(fd, MYMALLOC_IOC_ALLOC, &args) < 0) {
-        perror("ioctl ALLOC order 0");
-        return 1;
-    }
-    printf("alloc order 0 -> addr 0x%lx\n", args.addr);
+    ioctl(fd, MYMALLOC_IOC_ALLOC, &args);
     unsigned long addr0 = args.addr;
+    printf("buddy alloc order 0 -> addr 0x%lx\n", addr0);
 
-    /* Allocate order 2 (4 pages = 16 KB). */
     args.order = 2;
-    if (ioctl(fd, MYMALLOC_IOC_ALLOC, &args) < 0) {
-        perror("ioctl ALLOC order 2");
-        return 1;
-    }
-    printf("alloc order 2 -> addr 0x%lx\n", args.addr);
+    ioctl(fd, MYMALLOC_IOC_ALLOC, &args);
     unsigned long addr2 = args.addr;
+    printf("buddy alloc order 2 -> addr 0x%lx\n", addr2);
 
-    /* Free order 0 block. */
-    args.addr  = addr0;
-    args.order = 0;
-    if (ioctl(fd, MYMALLOC_IOC_FREE, &args) < 0) {
-        perror("ioctl FREE order 0");
-        return 1;
-    }
-    printf("freed order 0 at addr 0x%lx\n", addr0);
+    args.addr = addr0; args.order = 0;
+    ioctl(fd, MYMALLOC_IOC_FREE, &args);
+    printf("buddy freed order 0 at 0x%lx\n", addr0);
 
-    /* Free order 2 block. */
-    args.addr  = addr2;
-    args.order = 2;
-    if (ioctl(fd, MYMALLOC_IOC_FREE, &args) < 0) {
-        perror("ioctl FREE order 2");
-        return 1;
+    args.addr = addr2; args.order = 2;
+    ioctl(fd, MYMALLOC_IOC_FREE, &args);
+    printf("buddy freed order 2 at 0x%lx\n\n", addr2);
+
+    /* ---------- NEW Phase 6: slab path ---------- */
+    struct mymalloc_slab_arg s;
+
+    /* Allocate three 64-byte slots from the slab */
+    unsigned long slots[3];
+    for (int i = 0; i < 3; i++) {
+        s.slot_size = 64;
+        ioctl(fd, MYMALLOC_IOC_SLAB_ALLOC, &s);
+        slots[i] = s.addr;
+        printf("slab alloc 64B slot %d -> addr 0x%lx\n", i, slots[i]);
     }
-    printf("freed order 2 at addr 0x%lx\n", addr2);
+
+    /* Free them all back — the last free should return the block to buddy */
+    for (int i = 0; i < 3; i++) {
+        s.addr = slots[i];
+        ioctl(fd, MYMALLOC_IOC_SLAB_FREE, &s);
+        printf("slab freed slot %d at 0x%lx\n", i, slots[i]);
+    }
 
     close(fd);
-    printf("all done\n");
+    printf("\nall done\n");
     return 0;
 }

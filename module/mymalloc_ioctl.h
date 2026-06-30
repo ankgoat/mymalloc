@@ -1,25 +1,38 @@
 #ifndef MYMALLOC_IOCTL_H
 #define MYMALLOC_IOCTL_H
-
 #include <linux/ioctl.h>
 
-/* The argument struct passed between userspace and the kernel.
- * For alloc: userspace fills in 'order', kernel fills in 'addr'.
- * For free:  userspace fills in both 'addr' and 'order'. */
 struct mymalloc_arg {
-    unsigned long addr;  /* virtual address of the block (offset from pool_addr) */
-    unsigned int  order; /* order of the block (0,1,2,...,POOL_ORDER) */
+    unsigned long addr;
+    unsigned int  order;
 };
 
-/* Magic number — uniquely identifies our device's ioctl commands.
- * Chosen to avoid clashing with other drivers. */
-#define MYMALLOC_IOC_MAGIC 0xBB
+struct mymalloc_slab_arg {
+    unsigned long addr;
+    unsigned int  slot_size;
+};
 
-/* ALLOC command: userspace passes order in, kernel writes addr back. */
-#define MYMALLOC_IOC_ALLOC _IOWR(MYMALLOC_IOC_MAGIC, 1, struct mymalloc_arg)
+#define MYMALLOC_IOC_MAGIC      0xBB
 
-/* FREE command: userspace passes both addr and order in. */
-#define MYMALLOC_IOC_FREE  _IOW(MYMALLOC_IOC_MAGIC, 2, struct mymalloc_arg)
+#define MYMALLOC_IOC_ALLOC      _IOWR(MYMALLOC_IOC_MAGIC, 1, struct mymalloc_arg)
+#define MYMALLOC_IOC_FREE       _IOW (MYMALLOC_IOC_MAGIC, 2, struct mymalloc_arg)
+#define MYMALLOC_IOC_SLAB_ALLOC _IOWR(MYMALLOC_IOC_MAGIC, 3, struct mymalloc_slab_arg)
+#define MYMALLOC_IOC_SLAB_FREE  _IOW (MYMALLOC_IOC_MAGIC, 4, struct mymalloc_slab_arg)
 
-#endif /* MYALLOC_IOCTL_H */
+/*
+ * Phase 11: ML hint argument.
+ * action: 0 = NOOP, 1 = PRESPLIT, 2 = PRECOALESCE
+ * order:  the allocation order the hint applies to
+ */
+struct mymalloc_hint_arg {
+    unsigned int action;
+    unsigned int order;
+};
 
+#define MYMALLOC_HINT_NOOP        0
+#define MYMALLOC_HINT_PRESPLIT    1
+#define MYMALLOC_HINT_PRECOALESCE 2
+
+#define MYMALLOC_IOC_HINT _IOW(MYMALLOC_IOC_MAGIC, 5, struct mymalloc_hint_arg)
+
+#endif /* MYMALLOC_IOCTL_H */
