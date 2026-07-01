@@ -79,6 +79,11 @@ static unsigned int       trace_count;  /* total events ever recorded          *
 /* One spinlock guards ALL allocator state: free lists, counts, slab, trace. */
 static DEFINE_SPINLOCK(allocator_lock);
 
+/* Phase 11: counters for ML hint outcomes, exposed via /proc/mymalloc/status. */
+static unsigned long hint_presplit_count    = 0;
+static unsigned long hint_precoalesce_count = 0;
+static unsigned long hint_noop_count        = 0;
+
 /* ---------- address helpers ---------- */
 
 static inline unsigned long addr_to_offset(unsigned long addr)
@@ -355,6 +360,8 @@ static int status_show(struct seq_file *m, void *v)
 
     seq_printf(m, "fragmentation score : %u / 100\n", compute_frag_score());
     seq_printf(m, "trace events recorded: %u\n", trace_count);
+    seq_printf(m, "hints: presplit=%lu precoalesce=%lu noop=%lu\n",
+               hint_presplit_count, hint_precoalesce_count, hint_noop_count);
     return 0;
 }
 
@@ -409,6 +416,98 @@ static const struct proc_ops trace_ops = {
     .proc_lseek   = seq_lseek,
     .proc_release = single_release,
 };
+
+/* ---------- Phase 11: ML hint handling ---------- */
+
+/* Ensure a free block exists at target_order by splitting down from the
+ * smallest larger free block. Caller must hold allocator_lock.
+ * Returns 0 on success, -ENOMEM if nothing big enough exists to split. */
+static int do_presplit(unsigned int target_order)
+{
+    unsigned int cur_order;
+    struct block *blk;
+    unsigned long offset;
+
+    if (target_order > POOL_ORDER)
+        return -EINVAL;
+
+    if (free_counts[target_order] > 0)
+        return 0;  /* already have one -- nothing to do */
+
+    for (cur_order = target_order + 1; cur_order <= POOL_ORDER; cur_order++) {
+        if (free_counts[cur_order] > 0)
+            break;
+    }
+    if (cur_order > POOL_ORDER)
+        return -ENOMEM;  /* nothing large enough to split */
+
+    blk = list_first_entry(&free_lists[cur_order], struct block, node);
+    list_del_init(&blk->node);
+    free_counts[cur_order]--;
+    offset = (unsigned long)(blk - block_map);
+
+    while (cur_order > target_order) {
+        unsigned long buddy_offset;
+        struct block *buddy;
+        cur_order--;
+        buddy_offset = offset + (1UL << cur_order);
+        buddy = &block_map[buddy_offset];
+        buddy->order = cur_order;
+        buddy->free  = true;
+        list_add(&buddy->node, &free_lists[cur_order]);
+        free_counts[cur_order]++;
+    }
+
+    blk->order = target_order;
+    blk->free  = true;
+    list_add(&blk->node, &free_lists[target_order]);
+    free_counts[target_order]++;
+
+    pr_info("mymalloc: hint PRESPLIT -> order %u now has a free block\n",
+            target_order);
+    return 0;
+}
+
+/* At target_order, look for a free block whose buddy is also free and merge
+ * them into target_order+1. Caller must hold allocator_lock.
+ * Returns 1 if a merge happened, 0 otherwise. */
+static int do_precoalesce(unsigned int target_order)
+{
+    struct list_head *pos, *tmp;
+    unsigned long base_offset;
+
+    if (target_order >= POOL_ORDER)
+        return 0;
+
+    list_for_each_safe(pos, tmp, &free_lists[target_order]) {
+        struct block *blk = list_entry(pos, struct block, node);
+        unsigned long offset = (unsigned long)(blk - block_map);
+        unsigned long buddy_offset = offset ^ (1UL << target_order);
+        struct block *buddy = &block_map[buddy_offset];
+
+        if (!buddy->free || buddy->order != target_order)
+            continue;
+        if (buddy == blk)
+            continue;
+
+        /* Remove both from the order-target_order free list. */
+        list_del_init(&blk->node);
+        list_del_init(&buddy->node);
+        free_counts[target_order] -= 2;
+
+        base_offset = offset & ~(1UL << target_order);
+        blk = &block_map[base_offset];
+        blk->order = target_order + 1;
+        blk->free  = true;
+        list_add(&blk->node, &free_lists[target_order + 1]);
+        free_counts[target_order + 1]++;
+
+        pr_info("mymalloc: hint PRECOALESCE -> merged into order %u\n",
+                target_order + 1);
+        return 1;
+    }
+    return 0;
+}
 
 /* ---------- character device file operations ---------- */
 
@@ -478,6 +577,33 @@ static long mymalloc_ioctl(struct file *file, unsigned int cmd,
         spin_lock_irqsave(&allocator_lock, flags);
         slab_free(kslab.addr);
         trace_record("slab_free", 0, kslab.addr);
+        spin_unlock_irqrestore(&allocator_lock, flags);
+        break;
+    }
+    case MYMALLOC_IOC_HINT: {
+        struct mymalloc_hint_arg khint;
+        unsigned long flags;
+
+        if (copy_from_user(&khint, (void __user *)arg, sizeof(khint)))
+            return -EFAULT;
+        if (khint.order > POOL_ORDER)
+            return -EINVAL;
+
+        spin_lock_irqsave(&allocator_lock, flags);
+        switch (khint.action) {
+        case MYMALLOC_HINT_PRESPLIT:
+            do_presplit(khint.order);
+            hint_presplit_count++;
+            break;
+        case MYMALLOC_HINT_PRECOALESCE:
+            do_precoalesce(khint.order);
+            hint_precoalesce_count++;
+            break;
+        case MYMALLOC_HINT_NOOP:
+        default:
+            hint_noop_count++;
+            break;
+        }
         spin_unlock_irqrestore(&allocator_lock, flags);
         break;
     }
