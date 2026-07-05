@@ -39,7 +39,7 @@ def run():
 
     while True:
         try:
-            if not os.path.exists(TRACE_FIwhat LE):
+            if not os.path.exists(TRACE_FILE):
                 time.sleep(POLL_INTERVAL)
                 continue
             with open(TRACE_FILE, "r") as f:

@@ -6,7 +6,8 @@ busybox-1.36.1.tar.bz2
 
 # Build artifacts
 initramfs.cpio.gz
-initramfs/
+initramfs/*
+!initramfs/init
 build.log
 module/*.ko
 module/*.o
@@ -15,3 +16,5 @@ module/*.mod.c
 module/.*.cmd
 module/Module.symvers
 module/modules.order
+__pycache__/
+*.pyc

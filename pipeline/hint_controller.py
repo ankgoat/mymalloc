@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
 """
-hint_controller.py — Phase 11
+hint_controller.py -- Phase 11 live bridge, host side.
 
-Receives ML predictions from ml_server.py over a Unix domain socket and
-issues real MYMALLOC_IOC_HINT ioctl calls to /dev/mymalloc.
+Receives ML predictions from ml_server.py over the existing Unix domain
+socket, and writes each hint as its own file on the 9p-shared directory
+that hint_inject.c (running inside the VM) polls and turns into a real
+MYMALLOC_IOC_HINT ioctl call.
+
+File-per-hint protocol: each hint is written as ~/mymalloc/share/hint_NNNNN,
+containing one line "ACTION ORDER". The VM daemon reads and unlinks each
+file, so hints can never fire twice. This replaces the earlier append-log
+design that suffered from double-firing across polls on 9p.
 
 A/B testing:
-    MYMALLOC_HINTS_ENABLED=1   (default)  → ioctl call is made
-    MYMALLOC_HINTS_ENABLED=0              → ioctl call is skipped (baseline)
+    MYMALLOC_HINTS_ENABLED=1   (default)  -> hints are written to the share
+    MYMALLOC_HINTS_ENABLED=0              -> hints are logged but NOT written
+                                              (baseline run)
 
-Run order from the README:
+Run order (unchanged from the README):
     Terminal 1: python3 ~/mymalloc/pipeline/ml_server.py
     Terminal 2: python3 ~/mymalloc/pipeline/hint_controller.py
     Terminal 3: python3 ~/mymalloc/pipeline/dashboard.py
     Terminal 4: python3 ~/mymalloc/pipeline/collector_dashboard.py
+
+Before starting this, the VM must be booted with the 9p share mounted
+and hint_inject running in the background inside the VM:
+    ~ # ./hint_inject &
 """
 
-import fcntl
 import json
 import os
 import socket
-import struct
 import sys
 import time
 
@@ -28,99 +38,66 @@ import time
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEVICE_PATH       = "/dev/mymalloc"
-HINT_SOCKET_PATH  = "/tmp/mymalloc_hints.sock"   # ml_server.py publishes hints here
-HINTS_ENABLED     = os.environ.get("MYMALLOC_HINTS_ENABLED", "1") == "1"
+HINT_SOCKET_PATH = "/tmp/mymalloc_hints.sock"   # ml_server.py publishes hints here
+SHARE_DIR        = os.path.expanduser("~/mymalloc/share")
+HINT_PREFIX      = "hint_"                       # file-per-hint protocol
+HINTS_ENABLED    = os.environ.get("MYMALLOC_HINTS_ENABLED", "1") == "1"
+
+ACTION_NAMES = {0: "NOOP", 1: "PRESPLIT", 2: "PRECOALESCE"}
 
 # ---------------------------------------------------------------------------
-# ioctl number computation — must match the C _IOW macro exactly
-#
-#   #define MYMALLOC_IOC_MAGIC 0xBB
-#   #define MYMALLOC_IOC_HINT  _IOW(MYMALLOC_IOC_MAGIC, 5, struct mymalloc_hint_arg)
-#
-#   struct mymalloc_hint_arg { unsigned int action; unsigned int order; };
-#     → size = 8 bytes
-#
-#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
-#   _IOW = direction bits = 0b01 → 0x40000000
+# Share-directory setup
 # ---------------------------------------------------------------------------
 
-_IOC_WRITE         = 0x40000000
-MYMALLOC_IOC_MAGIC = 0xBB
-HINT_CMD_NR        = 5
-HINT_STRUCT_SIZE   = 8   # two unsigned ints
+hint_seq = 0
 
-MYMALLOC_IOC_HINT = (
-    _IOC_WRITE
-    | (HINT_STRUCT_SIZE << 16)
-    | (MYMALLOC_IOC_MAGIC << 8)
-    | HINT_CMD_NR
-)
-
-ACTION_MAP = {
-    "NOOP":        0,
-    "PRESPLIT":    1,
-    "PRECOALESCE": 2,
-}
-
-# ---------------------------------------------------------------------------
-# Device handle
-# ---------------------------------------------------------------------------
-
-device_fd = None
-
-def open_device():
-    """Open /dev/mymalloc once at startup. Returns fd or None on failure."""
-    global device_fd
+def prepare_share_dir():
+    """Create the share directory and clear any stale hint_* files from a previous run."""
     if not HINTS_ENABLED:
-        print("[hint_ctrl] MYMALLOC_HINTS_ENABLED=0 — baseline mode, device NOT opened")
-        return None
-    try:
-        device_fd = os.open(DEVICE_PATH, os.O_RDWR)
-        print(f"[hint_ctrl] opened {DEVICE_PATH} fd={device_fd}")
-        print(f"[hint_ctrl] MYMALLOC_IOC_HINT = 0x{MYMALLOC_IOC_HINT:08x}")
-        return device_fd
-    except OSError as e:
-        print(f"[hint_ctrl] FATAL: cannot open {DEVICE_PATH}: {e}")
-        print("[hint_ctrl] is the module loaded? did you mknod /dev/mymalloc?")
-        sys.exit(1)
+        print("[hint_ctrl] MYMALLOC_HINTS_ENABLED=0 -- baseline mode, no hint files will be written")
+        return
+    os.makedirs(SHARE_DIR, exist_ok=True)
+    stale = [f for f in os.listdir(SHARE_DIR) if f.startswith(HINT_PREFIX)]
+    for f in stale:
+        try:
+            os.remove(os.path.join(SHARE_DIR, f))
+        except OSError:
+            pass
+    if stale:
+        print(f"[hint_ctrl] cleared {len(stale)} stale hint file(s) from {SHARE_DIR}")
+    print(f"[hint_ctrl] writing hints to {SHARE_DIR}/{HINT_PREFIX}NNNNN")
 
 # ---------------------------------------------------------------------------
-# ioctl helpers
-# ---------------------------------------------------------------------------
-
 # Counters for reporting
+# ---------------------------------------------------------------------------
+
 sent_counts = {"PRESPLIT": 0, "PRECOALESCE": 0, "NOOP": 0}
 skipped     = 0
-failed      = 0
 
-def send_ioctl_hint(action_str, order):
-    """Pack and send a hint ioctl. action_str ∈ {PRESPLIT, PRECOALESCE, NOOP}."""
-    global failed, skipped
-
-    action_int = ACTION_MAP.get(action_str, 0)
-
-    # Always log; only ioctl if hints enabled and device opened.
-    if not HINTS_ENABLED or device_fd is None:
+def send_hint(action_str, order):
+    global skipped, hint_seq
+    if not HINTS_ENABLED:
         skipped += 1
-        print(f"[hint_ctrl] (skipped — baseline) action={action_str} order={order}")
+        print(f"[hint_ctrl] (skipped -- baseline) action={action_str} order={order}")
         return
-
-    packed = struct.pack("II", action_int, int(order))
-    try:
-        fcntl.ioctl(device_fd, MYMALLOC_IOC_HINT, packed)
-        sent_counts[action_str] = sent_counts.get(action_str, 0) + 1
-        print(f"[hint_ctrl] → ioctl HINT action={action_str}({action_int}) order={order}")
-    except OSError as e:
-        failed += 1
-        print(f"[hint_ctrl] ioctl FAILED action={action_str} order={order}: {e}")
+    hint_seq += 1
+    # Write to a temp name first, then rename atomically so the VM daemon
+    # never sees a partially-written hint file.
+    fname      = f"{HINT_PREFIX}{hint_seq:05d}"
+    tmp_path   = os.path.join(SHARE_DIR, fname + ".tmp")
+    final_path = os.path.join(SHARE_DIR, fname)
+    with open(tmp_path, "w") as f:
+        f.write(f"{action_str} {order}\n")
+    os.rename(tmp_path, final_path)
+    sent_counts[action_str] = sent_counts.get(action_str, 0) + 1
+    print(f"[hint_ctrl] -> wrote {final_path} ({action_str} {order}) "
+          f"(sent so far: {sent_counts})")
 
 # ---------------------------------------------------------------------------
-# Socket loop — connect to ml_server.py and read JSON hints
+# Socket loop -- connect to ml_server.py and read JSON hints
 # ---------------------------------------------------------------------------
 
 def connect_to_ml_server(retries=10, delay=0.5):
-    """Connect to the ml_server hint socket with retries."""
     for attempt in range(retries):
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -135,7 +112,6 @@ def connect_to_ml_server(retries=10, delay=0.5):
             time.sleep(delay)
 
 def read_jsonl(sock):
-    """Yield JSON-decoded messages from a stream-oriented socket, one per newline."""
     buf = b""
     while True:
         chunk = sock.recv(4096)
@@ -161,30 +137,27 @@ def print_summary():
     print("[hint_ctrl] ===== session summary =====")
     print(f"[hint_ctrl] hints enabled: {HINTS_ENABLED}")
     for action, n in sent_counts.items():
-        print(f"[hint_ctrl]   {action:12s} sent: {n}")
+        print(f"[hint_ctrl]   {action:12s} written: {n}")
     print(f"[hint_ctrl]   skipped (baseline): {skipped}")
-    print(f"[hint_ctrl]   ioctl failures:     {failed}")
     print("[hint_ctrl] ===========================")
 
 def main():
-    print(f"[hint_ctrl] Phase 11 hint controller starting")
+    print("[hint_ctrl] Phase 11 hint controller (file-per-hint 9p bridge) starting")
     print(f"[hint_ctrl] hints enabled: {HINTS_ENABLED}")
 
-    open_device()
+    prepare_share_dir()
     sock = connect_to_ml_server()
 
     try:
         for msg in read_jsonl(sock):
-            # Expected message shape from ml_server.py:
-            #   { "pred": 42.7, "actual": 39.5, "hint": "PRESPLIT", "order": 3, ... }
-            action = msg.get("hint", "NOOP")
-            order  = msg.get("order", 0)
-            send_ioctl_hint(action, order)
+            # ml_server.py message shape (per existing code):
+            #   {"predicted_order": <int>, "action": "PRESPLIT"|"PRECOALESCE"|"NOOP"}
+            action = msg.get("action", "NOOP")
+            order  = msg.get("predicted_order", 0)
+            send_hint(action, order)
     except KeyboardInterrupt:
         print("\n[hint_ctrl] interrupted")
     finally:
-        if device_fd is not None:
-            os.close(device_fd)
         sock.close()
         print_summary()
 
