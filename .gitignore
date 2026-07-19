@@ -18,3 +18,9 @@ module/Module.symvers
 module/modules.order
 __pycache__/
 *.pyc
+initramfs/hint_inject
+hint_inject
+test_hint
+share/hint_*
+share/*.txt
+share/*.tmp
